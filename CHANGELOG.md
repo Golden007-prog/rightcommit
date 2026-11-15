@@ -3,6 +3,27 @@
 What changed in each version of rightcommit. Releases are also listed on
 [GitHub](https://github.com/rightcommit/rightcommit/releases).
 
+## [1.6.0] - 2026-11-15
+
+### Added
+
+- While the Project Manager works, one line in the chat follows the tool it is using, such as
+  "Opens github.com/…" or "Runs python3 …". It goes away when the reply arrives, when you stop
+  it or on an error.
+- A **Stop** button replaces **Send** while the Project Manager works. It ends the current
+  turn and its agent processes; your message stays in the chat and you can send a new one.
+- A restart icon on your messages in the Project Manager chat restarts the conversation from
+  that message: the message and the ones after it are removed, then it is sent again in a new
+  agent session that knows only the earlier messages.
+
+### Fixed
+
+- When the provider's safety rules block a request, for example about penetration testing or
+  exploit tools, the agent error now says so instead of pointing to the agent configuration.
+- A Project Manager turn with Pi that times out before using any tool is retried once. Turns
+  that already used tools are not repeated, and a turn that hits rightcommit's own time limit
+  says so.
+
 ## [1.5.1] - 2026-11-13
 
 ### Added

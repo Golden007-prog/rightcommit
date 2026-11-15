@@ -14,9 +14,11 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
+    sync::{LazyLock, Mutex},
 };
+use tokio::sync::watch;
 
 pub const BINDING: &str = "manager:chat";
 pub const CONTRACT: &str = r#"
@@ -188,6 +190,82 @@ fn acquire(app: &App, uid: i64, id: &str) -> Result<Lease> {
         id: id.into(),
         uid,
     })
+}
+/// Stop signals of the manager turns in progress, by conversation ID.
+static STOPS: LazyLock<Mutex<HashMap<String, watch::Sender<bool>>>> =
+    LazyLock::new(Default::default);
+pub(crate) const STOPPED: &str = "Elaborazione interrotta. Puoi inviare un nuovo messaggio.";
+struct StopSignal(String);
+impl StopSignal {
+    fn register(id: &str) -> (Self, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        STOPS.lock().unwrap().insert(id.into(), sender);
+        (Self(id.into()), receiver)
+    }
+}
+impl Drop for StopSignal {
+    fn drop(&mut self) {
+        STOPS.lock().unwrap().remove(&self.0);
+    }
+}
+/// Runs a manager turn until it ends or the user stops it. Dropping the turn kills the agent's
+/// process group, as stopping a run does; the native session stays available for the next message.
+async fn stoppable<T>(
+    stop: &mut watch::Receiver<bool>,
+    turn: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        result = turn => result,
+        _ = stop.wait_for(|stopped| *stopped) => Err(anyhow::anyhow!(STOPPED)),
+    }
+}
+pub async fn stop(
+    State(app): State<App>,
+    u: User,
+    Json(q): Json<Scope>,
+) -> ApiResult<Json<Value>> {
+    check_scope(&app, u.id, &q.workflow_id, q.run_id.as_deref())?;
+    let record = load_target(&app, u.id, &q.workflow_id, q.run_id.as_deref(), None)?;
+    let stopped = record
+        .and_then(|r| STOPS.lock().unwrap().get(&r.id).map(|s| s.send(true).is_ok()))
+        .unwrap_or(false);
+    Ok(Json(json!({"stopped": stopped})))
+}
+#[derive(Deserialize)]
+pub struct ActivityQuery {
+    workflow_id: String,
+    run_id: Option<String>,
+    after: Option<i64>,
+}
+/// The tools the manager used after `after`. Without `after`, only the cursor to start from.
+pub async fn activity(
+    State(app): State<App>,
+    u: User,
+    Query(q): Query<ActivityQuery>,
+) -> ApiResult<Json<Value>> {
+    check_scope(&app, u.id, &q.workflow_id, q.run_id.as_deref())?;
+    let Some(record) = load_target(&app, u.id, &q.workflow_id, q.run_id.as_deref(), None)? else {
+        return Ok(Json(json!({"cursor": 0, "events": []})));
+    };
+    let Some(after) = q.after else {
+        let cursor: i64 = app.store.db.lock().unwrap()
+            .query_row("SELECT coalesce(max(seq),0) FROM events WHERE user_id=? AND run=?", params![u.id, record.id], |r| r.get(0))
+            .map_err(anyhow::Error::from)?;
+        return Ok(Json(json!({"cursor": cursor, "events": []})));
+    };
+    let events = app.store.events(u.id, &record.id, after)?;
+    let cursor = events.last().map_or(after, |e| e.seq);
+    let events: Vec<Value> = events
+        .into_iter()
+        .filter(|e| e.kind == "activity")
+        .filter_map(|e| {
+            let v: Value = serde_json::from_str(&e.text).ok()?;
+            let detail: String = v["detail"].as_str().unwrap_or("").chars().take(200).collect();
+            Some(json!({"seq": e.seq, "id": v["id"], "tool": v["tool"], "phase": v["phase"], "detail": detail}))
+        })
+        .filter(|v| v["tool"].is_string())
+        .collect();
+    Ok(Json(json!({"cursor": cursor, "events": events})))
 }
 fn check_scope(app: &App, uid: i64, wid: &str, rid: Option<&str>) -> Result<()> {
     ensure!(!wid.is_empty() && wid.len() < 100, "Workflow non valido");
@@ -522,6 +600,7 @@ pub async fn chat(
     let guard = lifecycle.read().await;
     let initial = get_or_create(&app, u.id, &req)?;
     let _lease = acquire(&app, u.id, &initial.id)?;
+    let (_stop_signal, mut stop) = StopSignal::register(&initial.id);
     let mut record = load(
         &app,
         u.id,
@@ -553,22 +632,31 @@ pub async fn chat(
         "Read the updated context files for this turn. Current authenticated user request: {}",
         req.message
     );
-    let response = agents::turn(
-        &app,
-        u.id,
-        &mut record.runtime,
-        agents::Turn {
-            binding: BINDING,
-            runtime: &runtime,
-            model_override: "",
+    let response = stoppable(
+        &mut stop,
+        agents::turn(
+            &app,
+            u.id,
+            &mut record.runtime,
+            agents::Turn {
+                binding: BINDING,
+                runtime: &runtime,
+                model_override: "",
                 provider_override: "",
                 base_url_override: "",
-            prompt: &prompt,
-        },
+                prompt: &prompt,
+            },
+        ),
     )
     .await;
     let mut out = match response {
         Ok(out) => out,
+        Err(error) if error.to_string() == STOPPED => {
+            save(&app, u.id, &record)?;
+            return Ok(Json(
+                json!({"messages":messages_public(&record.messages),"stopped":true,"conversation_id":record.id,"runtime":runtime}),
+            ));
+        }
         Err(error) => {
             // Keep the user's message, but never persist the external error payload.
             save(&app, u.id, &record)?;
@@ -600,18 +688,22 @@ pub async fn chat(
             "Your previous proposal has this validation issue: {error}. Repair the COMPLETE graph now using context/guide.json. Do not merely describe it. Include a Source for a runnable root workflow (built-in example is available). Gate success needs an actual downstream terminal node; never leave an advertised pass branch without a target. Preserve the user's objective. Return the structured workflow result. Previous proposal: {}",
             out.details
         );
-        if let Ok(repaired) = agents::turn(
-            &app,
-            u.id,
-            &mut record.runtime,
-            agents::Turn {
-                binding: BINDING,
-                runtime: &runtime,
-                model_override: "",
-                provider_override: "",
-                base_url_override: "",
-                prompt: &prompt,
-            },
+        // A stop during the repair keeps the first proposal, as a failed repair does.
+        if let Ok(repaired) = stoppable(
+            &mut stop,
+            agents::turn(
+                &app,
+                u.id,
+                &mut record.runtime,
+                agents::Turn {
+                    binding: BINDING,
+                    runtime: &runtime,
+                    model_override: "",
+                    provider_override: "",
+                    base_url_override: "",
+                    prompt: &prompt,
+                },
+            ),
         )
         .await
         {
@@ -729,6 +821,45 @@ pub async fn reset(
     Ok(Json(json!({"messages":[],"reset":true})))
 }
 
+#[derive(Deserialize)]
+pub struct Rewind {
+    workflow_id: String,
+    run_id: Option<String>,
+    index: usize,
+}
+/// Removes a user message and everything after it, and retires the native session: the next
+/// turn opens a new one that knows only the earlier messages, from context/conversation.json.
+/// The client then sends the removed message again.
+pub async fn rewind(
+    State(app): State<App>,
+    u: User,
+    Json(q): Json<Rewind>,
+) -> ApiResult<Json<Value>> {
+    check_scope(&app, u.id, &q.workflow_id, q.run_id.as_deref())?;
+    let _guard = app.lifecycle.read().await;
+    let mut record = load_target(&app, u.id, &q.workflow_id, q.run_id.as_deref(), None)?
+        .context("Conversazione mancante")?;
+    let _lease = acquire(&app, u.id, &record.id)?;
+    let message = record
+        .messages
+        .get(q.index)
+        .filter(|m| m.role == "user")
+        .map(|m| m.text.clone())
+        .ok_or_else(|| bad("Messaggio non trovato: ricarica la chat e riprova"))?;
+    record.messages.truncate(q.index);
+    record
+        .retired_sessions
+        .extend(record.runtime.sessions.values().cloned());
+    record.runtime.sessions.clear();
+    if record.proposal.as_ref().is_some_and(|p| !p.resolved) {
+        record.proposal = None;
+    }
+    save(&app, u.id, &record)?;
+    Ok(Json(
+        json!({"messages":messages_public(&record.messages),"message":message,"conversation_id":record.id}),
+    ))
+}
+
 pub struct Cleanup {
     pub id: String,
     pub workspace: PathBuf,
@@ -807,6 +938,171 @@ mod tests {
             conversation_id: None,
         }
     }
+
+    #[tokio::test]
+    async fn rewind_restarts_from_a_user_message_in_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::tests::app(dir.path());
+        let mut req = request();
+        req.workflow.id = "rewind-test".into();
+        let mut record = get_or_create(&app, 1, &req).unwrap();
+        for (role, text) in [("user", "first"), ("assistant", "one"), ("user", "second"), ("assistant", "two")] {
+            record.messages.push(Message { role: role.into(), text: text.into(), created: 1 });
+        }
+        let session = NativeSession { provider: String::new(), base_url: String::new(), runtime: "pi".into(), native_id: "old-session".into(), turns: 2, model: "m".into() };
+        record.runtime.sessions.insert(BINDING.into(), session);
+        save(&app, 1, &record).unwrap();
+        let user = || User { id: 1, email: "manager@test.local".into() };
+        let body = |index| Json(Rewind { workflow_id: "rewind-test".into(), run_id: None, index });
+
+        let error = rewind(State(app.clone()), user(), body(1)).await.unwrap_err();
+        assert!(error.1.contains("Messaggio non trovato"), "assistant messages cannot be restarted");
+        assert!(rewind(State(app.clone()), user(), body(9)).await.is_err());
+        {
+            let _busy = acquire(&app, 1, &record.id).unwrap();
+            assert!(rewind(State(app.clone()), user(), body(2)).await.is_err(), "not while the manager works");
+        }
+
+        let reply = rewind(State(app.clone()), user(), body(2)).await.unwrap().0;
+        assert_eq!(reply["message"], "second");
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 2);
+        let saved = load(&app, 1, &scope_key("rewind-test", None)).unwrap().unwrap();
+        assert_eq!(saved.messages.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["first", "one"]);
+        assert!(saved.runtime.sessions.is_empty(), "the next turn opens a new native session");
+        assert_eq!(saved.retired_sessions[0].native_id, "old-session");
+    }
+
+    #[tokio::test]
+    async fn manager_shows_tool_activity_and_stop_ends_the_turn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::tests::app(dir.path());
+        app.store.update_settings(1, |settings| {
+            settings.default_runtime = "pi".into();
+            settings.agents.insert("pi".into(), AgentConfig {
+                provider: "anthropic".into(),
+                model: "test-model".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            });
+            Ok(())
+        }).unwrap();
+        let tools = crate::distribution::tools(dir.path());
+        std::fs::create_dir_all(&tools).unwrap();
+        let binary = tools.join("pi");
+        // Starts a tool, then keeps working: only a stop ends the turn before "finished" is written.
+        std::fs::write(&binary, r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"type":"tool_execution_start","toolCallId":"call-1","toolName":"web_fetch","args":{"url":"https://example.com/page"}}'
+sleep 3
+touch finished
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut req = request();
+        req.workflow.id = "stop-test".into();
+        let user = || User { id: 1, email: "manager@test.local".into() };
+        let turn = tokio::spawn(chat(State(app.clone()), user(), Json(req)));
+        let mut seen = None;
+        for _ in 0..100 {
+            let reply = activity(State(app.clone()), user(), Query(ActivityQuery { workflow_id: "stop-test".into(), run_id: None, after: Some(0) })).await.unwrap().0;
+            if let Some(event) = reply["events"].as_array().and_then(|e| e.first()) {
+                seen = Some(event.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let event = seen.expect("tool activity while the manager works");
+        assert_eq!(event["tool"], "web_fetch");
+        assert_eq!(event["phase"], "start");
+        assert_eq!(event["detail"], "https://example.com/page");
+
+        let stopped = stop(State(app.clone()), user(), Json(Scope { workflow_id: "stop-test".into(), run_id: None })).await.unwrap().0;
+        assert_eq!(stopped["stopped"], true);
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), turn).await.expect("stop ends the turn").unwrap().unwrap().0;
+        assert_eq!(reply["stopped"], true);
+        let record = load(&app, 1, &scope_key("stop-test", None)).unwrap().unwrap();
+        assert_eq!(record.messages.len(), 1, "the user's message stays, no reply is invented");
+        // The lease is released and the agent's processes are gone.
+        acquire(&app, 1, &record.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(!PathBuf::from(&record.runtime.workspace).join("finished").exists());
+        let again = stop(State(app.clone()), user(), Json(Scope { workflow_id: "stop-test".into(), run_id: None })).await.unwrap().0;
+        assert_eq!(again["stopped"], false);
+    }
+
+    #[tokio::test]
+    async fn pi_manager_recovers_from_timeouts_without_replaying_tools() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = crate::tests::app(dir.path());
+        app.store.update_settings(1, |settings| {
+            settings.default_runtime = "pi".into();
+            settings.agents.insert("pi".into(), AgentConfig {
+                provider: "anthropic".into(),
+                model: "test-model".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            });
+            Ok(())
+        }).unwrap();
+        let tools = crate::distribution::tools(dir.path());
+        std::fs::create_dir_all(&tools).unwrap();
+        let binary = tools.join("pi");
+        std::fs::write(&binary, r#"#!/bin/sh
+prompt=$(cat)
+timeout() {
+  printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"Request timed out","content":[]}}'
+}
+case "$prompt" in
+  *native-retry*)
+    timeout
+    printf '%s\n' '{"type":"auto_retry_start"}' '{"type":"auto_retry_end","success":true}' ;;
+  *native-exhausted*)
+    timeout
+    printf '%s\n' '{"type":"auto_retry_start"}' '{"type":"auto_retry_end","success":false}'
+    exit 1 ;;
+  *after-tool*)
+    printf '%s\n' '{"type":"tool_execution_start","toolName":"write"}'
+    timeout
+    exit 1 ;;
+  *before-tool*)
+    if [ ! -f first-attempt ]; then
+      touch first-attempt
+      timeout
+      exit 1
+    fi ;;
+esac
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"<nodo_result>{\"status\":\"completed\",\"summary\":\"OK\",\"decision\":\"explain\"}</nodo_result>"}]}}'
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for (message, expected_attempts, succeeds) in [
+            ("native-retry", 1, true),
+            ("native-exhausted", 1, false),
+            ("before-tool", 2, true),
+            ("after-tool", 1, false),
+        ] {
+            let mut req = request();
+            req.workflow.id = message.into();
+            req.message = message.into();
+            let scope = scope_key(&req.workflow.id, None);
+            let user = User { id: 1, email: "manager@test.local".into() };
+            let reply = chat(State(app.clone()), user, Json(req)).await;
+            let record = load(&app, 1, &scope).unwrap().unwrap();
+            let events = app.store.events(1, &record.id, 0).unwrap();
+            assert_eq!(events.iter().filter(|e| e.kind == "agent_turn").count(), expected_attempts, "{message}");
+            assert_eq!(record.messages.iter().filter(|m| m.role == "user").count(), 1);
+            if succeeds {
+                assert_eq!(reply.unwrap().0["messages"][1]["text"], "OK");
+            } else {
+                assert_eq!(reply.unwrap_err().1, "Una richiesta dell’agente non ha ricevuto risposta in tempo.");
+            }
+        }
+    }
+
     #[test]
     fn implementation_directories_follow_the_authenticated_account() {
         let dir = tempfile::tempdir().unwrap();

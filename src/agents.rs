@@ -804,7 +804,13 @@ fn pi_packages(extensions: &Path, cfg: &AgentConfig) -> Vec<PathBuf> {
 /// Public failure messages never include provider payloads, partial keys or request URLs.
 pub(crate) fn public_agent_failure(detail: &str) -> &'static str {
     let text = detail.to_ascii_lowercase();
-    if text.contains("401") || text.contains("incorrect api key") || text.contains("invalid api key") || text.contains("unauthorized") || text.contains("authentication") {
+    if detail == LOCAL_TURN_TIMEOUT {
+        "Il turno ha raggiunto il limite di tempo configurato in rightcommit."
+    } else if detail == MISSING_STRUCTURED_RESULT {
+        MISSING_STRUCTURED_RESULT
+    } else if text.contains("safeguards flagged") || text.contains("usage policy") || text.contains("cyber verification") || text.contains("refusal") {
+        "Il modello ha rifiutato la richiesta per le regole di sicurezza del provider, non per un errore di configurazione. Succede per esempio con strumenti di penetration test o exploit. Riformula la richiesta o scegli un altro modello."
+    } else if text.contains("401") || text.contains("incorrect api key") || text.contains("invalid api key") || text.contains("unauthorized") || text.contains("authentication") {
         "Il provider ha rifiutato le credenziali. Verifica la chiave API e il provider in Personal Settings → Agents, oppure le credenziali in .env."
     } else if text.contains("insufficient_quota") || text.contains("billing") || text.contains("credit balance") || text.contains("quota exceeded") {
         "Il credito o la quota del provider è esaurito. Verifica il piano e i limiti del tuo account prima di riprovare."
@@ -814,8 +820,8 @@ pub(crate) fn public_agent_failure(detail: &str) -> &'static str {
         "Il provider non consente questa richiesta. Verifica i permessi dell’account e l’accesso al modello selezionato."
     } else if text.contains("404") || text.contains("model_not_found") || text.contains("model not found") || text.contains("unknown model") {
         "Il modello o l’endpoint non è disponibile. Verifica provider, modello e URL in Personal Settings → Agents."
-    } else if text.contains("timeout") || text.contains("timed out") {
-        "Il provider non ha risposto in tempo. Puoi riprovare a inviare il messaggio."
+    } else if is_timeout(&text) {
+        "Una richiesta dell’agente non ha ricevuto risposta in tempo."
     } else if text.contains("connection") || text.contains("connect") || text.contains("dns") || text.contains("network") || text.contains("fetch failed") {
         "Impossibile raggiungere il provider. Verifica la connessione e l’URL configurato, poi riprova."
     } else if text.contains("500") || text.contains("502") || text.contains("503") || text.contains("overloaded") {
@@ -824,6 +830,58 @@ pub(crate) fn public_agent_failure(detail: &str) -> &'static str {
         "Un pacchetto Pi registra uno strumento già presente. Rimuovi il pacchetto in conflitto e riprova."
     } else {
         "L’agente non ha completato la risposta. Verifica la configurazione in Personal Settings → Agents e riprova."
+    }
+}
+
+const LOCAL_TURN_TIMEOUT: &str = "Turno interrotto o scaduto; la sessione salvata resta disponibile per un riesame manuale";
+const MISSING_STRUCTURED_RESULT: &str = "Risposta agente priva del risultato strutturato rightcommit. Riprendi nella stessa sessione con Retry.";
+
+fn is_timeout(text: &str) -> bool {
+    text.contains("timeout") || text.contains("timed out")
+}
+
+#[derive(Debug)]
+struct RetryablePiTimeout;
+
+impl std::fmt::Display for RetryablePiTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pi request timed out")
+    }
+}
+
+impl std::error::Error for RetryablePiTimeout {}
+
+#[derive(Default)]
+struct PiTurnStatus {
+    assistant_error: Option<String>,
+    timed_out: bool,
+    used_tools: bool,
+    retried: bool,
+}
+
+impl PiTurnStatus {
+    fn observe(&mut self, kind: &str, event: &Value) {
+        match kind {
+            "message_end" if event["message"]["role"] == "assistant" => {
+                let message = &event["message"];
+                let stop = message["stopReason"].as_str().unwrap_or_default();
+                let error = message["errorMessage"].as_str().unwrap_or_default();
+                self.assistant_error = matches!(stop, "error" | "aborted").then(|| {
+                    if error.is_empty() { message.to_string() } else { error.to_owned() }
+                });
+                self.timed_out = stop == "error" && is_timeout(&error.to_ascii_lowercase());
+                self.used_tools |= stop == "toolUse";
+            }
+            "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
+                self.used_tools = true;
+            }
+            "auto_retry_start" | "auto_retry_end" => self.retried = true,
+            _ => {}
+        }
+    }
+
+    fn can_retry(&self) -> bool {
+        self.timed_out && !self.used_tools && !self.retried
     }
 }
 
@@ -897,6 +955,7 @@ pub(crate) fn pi_arguments(
     args
 }
 
+#[derive(Clone, Copy)]
 pub struct Turn<'a> {
     pub binding: &'a str,
     pub runtime: &'a str,
@@ -923,6 +982,14 @@ pub(crate) fn validate_pi_model(runtime: &str, model: &str) -> Result<()> {
     Ok(())
 }
 pub async fn turn(app: &App, uid: i64, run: &mut Run, request: Turn<'_>) -> Result<AgentResult> {
+    let result = turn_once(app, uid, run, request).await;
+    if result.as_ref().is_err_and(|error| error.is::<RetryablePiTimeout>()) {
+        return turn_once(app, uid, run, request).await;
+    }
+    result
+}
+
+async fn turn_once(app: &App, uid: i64, run: &mut Run, request: Turn<'_>) -> Result<AgentResult> {
     crate::auth::ensure_active(app, uid)?;
     let Turn {
         binding,
@@ -1208,6 +1275,7 @@ runtime: runtime.into(),
     let rid = run.id.clone();
     let mut text = String::new();
     let mut failed = None;
+    let mut pi_status = PiTurnStatus::default();
     let mut seen_session = None;
     let mut count = 0usize;
     let started = std::time::Instant::now();
@@ -1266,6 +1334,9 @@ runtime: runtime.into(),
                 );
             }
             let ty = v["type"].as_str().unwrap_or("");
+            if runtime == "pi" {
+                pi_status.observe(ty, &v);
+            }
             if ty == "thread.started" {
                 seen_session = v["thread_id"].as_str().map(str::to_owned);
             }
@@ -1308,7 +1379,7 @@ runtime: runtime.into(),
                         })
                         .unwrap_or_default(),
                 );
-                if ["error", "aborted"].contains(&v["message"]["stopReason"].as_str().unwrap_or(""))
+                if runtime != "pi" && ["error", "aborted"].contains(&v["message"]["stopReason"].as_str().unwrap_or(""))
                 {
                     failed = Some(v["message"].to_string());
                 }
@@ -1316,11 +1387,13 @@ runtime: runtime.into(),
             if ["turn.failed", "error"].contains(&ty) {
                 failed = Some(v.to_string());
             }
-            if let Some(m) = message
-                && !m.is_empty()
-            {
-                text = m.clone();
-                emit(app, uid, &rid, "output", &node, &redact_turn(&m));
+            if let Some(m) = message {
+                if runtime == "pi" || !m.is_empty() {
+                    text.clone_from(&m);
+                }
+                if !m.is_empty() {
+                    emit(app, uid, &rid, "output", &node, &redact_turn(&m));
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -1343,12 +1416,15 @@ runtime: runtime.into(),
                 .finish(started.elapsed().as_millis() as u64, "interrupted")
                 .to_string(),
         );
-        bail!(
-            "Turno interrotto o scaduto; la sessione salvata resta disponibile per un riesame manuale"
-        );
+        match read_result {
+            Err(_) => bail!(LOCAL_TURN_TIMEOUT),
+            Ok(result) => result.context("Lettura dell’output dell’agente interrotta")?,
+        }
     }
     let status = child.wait().await?;
     let stderr = err_task.await.unwrap_or_default();
+    let retry_pi = managing && runtime == "pi" && failed.is_none() && pi_status.can_retry();
+    let failed = failed.or(pi_status.assistant_error);
     let compact_error =
         failed.as_deref().unwrap_or("").to_owned() + &String::from_utf8_lossy(&stderr);
     if compact_error.to_lowercase().contains("compact") && (failed.is_some() || !status.success()) {
@@ -1388,6 +1464,9 @@ runtime: runtime.into(),
     } else {
         save_turn_run(app, uid, run)?;
     }
+    if retry_pi {
+        return Err(RetryablePiTimeout.into());
+    }
     ensure!(
         status.success() && failed.is_none(),
         "{}",
@@ -1421,7 +1500,7 @@ pub fn parse_result(text: &str) -> Result<AgentResult> {
         .rsplit_once("<nodo_result>")
         .and_then(|(_, s)| s.split_once("</nodo_result>").map(|(j, _)| j))
         .unwrap_or(text);
-    let mut result:AgentResult=serde_json::from_str(raw.trim()).context("Risposta agente priva del risultato strutturato rightcommit. Riprendi nella stessa sessione con Retry.")?;
+    let mut result: AgentResult = serde_json::from_str(raw.trim()).context(MISSING_STRUCTURED_RESULT)?;
     // Only the parser can attest that it truncated the public report.
     result.details_truncated = false;
     if result.details.is_empty()

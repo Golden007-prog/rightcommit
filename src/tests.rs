@@ -1425,6 +1425,9 @@ fn manager_public_failures_never_expose_provider_payloads() {
         ("request timed out", "tempo"),
         ("fetch failed: connection refused", "raggiungere"),
         ("503 overloaded", "temporaneamente"),
+        ("Cyber safeguards flagged this message. If this is legitimate security work, you can apply for the Cyber Verification Program: https://support.claude.com/en/articles/14604842-cyber-verification-program.", "regole di sicurezza"),
+        ("API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup).", "regole di sicurezza"),
+        (r#"{"stop_reason":"refusal"}"#, "regole di sicurezza"),
         ("arbitrary failure fake-partial", "configurazione"),
     ];
     for (raw, expected) in cases {

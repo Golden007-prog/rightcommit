@@ -100,6 +100,18 @@ pub fn router(app: App) -> Router {
             axum::routing::post(crate::manager::reset),
         )
         .route(
+            "/api/manager/chat/rewind",
+            axum::routing::post(crate::manager::rewind),
+        )
+        .route(
+            "/api/manager/chat/stop",
+            axum::routing::post(crate::manager::stop),
+        )
+        .route(
+            "/api/manager/chat/activity",
+            axum::routing::get(crate::manager::activity),
+        )
+        .route(
             "/api/manager/chat/proposal/resolve",
             axum::routing::post(crate::manager::resolve_proposal),
         )

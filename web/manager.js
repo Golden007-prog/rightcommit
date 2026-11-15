@@ -95,9 +95,50 @@
   const expression=state.busy?'is-thinking':state.error?'is-concerned':'is-awake';
   return `<span id="manager-face" class="manager-face ${expression}" aria-hidden="true" ${faceCollapsed?'hidden':''}><span class="manager-face-orb"><svg viewBox="0 0 80 80" class="manager-face-drawing"><g class="manager-face-features"><g class="manager-face-eyes"><rect class="manager-face-eye" x="23" y="29" width="9" height="15" rx="4.5"/><rect class="manager-face-eye" x="48" y="29" width="9" height="15" rx="4.5"/></g><path class="manager-face-smile" d="M30 52 Q40 59 50 52"/></g></svg><span class="manager-face-blush left"></span><span class="manager-face-blush right"></span></span><span class="manager-face-spark"></span><span class="manager-face-thoughts"><i></i><i></i><i></i></span></span>`;
  }
+ // Short descriptions of the tools the manager uses while it works.
+ const toolVerbs={read:'Legge',bash:'Esegue',shell:'Esegue',commandexecution:'Esegue',webfetch:'Apre la pagina',websearch:'Cerca sul web',todo:'Aggiorna le attività',todowrite:'Aggiorna le attività',write:'Scrive',edit:'Modifica il file',multiedit:'Modifica il file',filechange:'Modifica il file',grep:'Cerca nel testo',find:'Cerca file',glob:'Cerca file',ls:'Elenca la cartella',mcp:'Usa uno strumento MCP',mcptoolcall:'Usa uno strumento MCP'};
+ function toolDetail(detail){
+  let text=String(detail||'').replace(/\s+/g,' ').trim();
+  if(/^https?:\/\//.test(text))text=text.replace(/^https?:\/\//,'');
+  else if(text.includes('/')&&!text.includes(' ')){const i=text.indexOf('/context/');text=i>=0?text.slice(i+1):text.split('/').slice(-2).join('/')}
+  return text.length>72?text.slice(0,71)+'…':text;
+ }
+ // One line that follows the latest tool; it goes away with the turn (reply, stop or error).
+ function activityHtml(state){
+  const item=(state.activity||[]).at(-1);
+  if(state.stopping||!item)return `<p class="manager-thinking">${icon('loader-circle')}<span>${state.stopping?'Interruzione in corso…':'Il manager sta analizzando il contesto…'}</span></p>`;
+  const verb=toolVerbs[String(item.tool).toLowerCase().replace(/[^a-z]/g,'')],detail=toolDetail(item.detail);
+  return `<p class="manager-thinking manager-activity-line">${icon('loader-circle')}<span>${verb?esc(verb):`Usa lo strumento <code data-no-i18n>${esc(item.tool)}</code>`}</span>${detail?`<code data-no-i18n title="${esc(item.detail)}">${esc(detail)}</code>`:''}</p>`;
+ }
+ function activityScope(){const q=new URLSearchParams({workflow_id:currentWorkflow().id});if(app.run)q.set('run_id',app.run.id);return q}
+ async function pollActivity(state,query,owner){
+  if(state.polling||state.cursor==null)return;state.polling=true;
+  try{
+   const result=await api('/manager/chat/activity?'+query+'&after='+state.cursor);state.cursor=result.cursor;
+   for(const event of result.events){const known=state.activity.find(item=>item.id===event.id);if(known){known.phase=event.phase;if(event.detail)known.detail=event.detail}else state.activity.push({...event})}
+   if(state.activity.length>20)state.activity.splice(0,state.activity.length-20);
+   const box=$('#manager-activity');
+   if(box&&state.busy&&scope===owner){const list=$('#manager-messages'),bottom=list.scrollHeight-list.scrollTop-list.clientHeight<40;box.innerHTML=activityHtml(state);if(bottom)list.scrollTop=list.scrollHeight}
+  }catch{}finally{state.polling=false}
+ }
+ async function rewindTo(state,index){
+  if(state.busy)return;
+  if(!await appConfirm({title:'Ripartire da questo messaggio?',message:'Il messaggio e quelli successivi vengono tolti dalla chat, poi il messaggio viene inviato di nuovo. Il manager apre una nuova sessione che conosce solo i messaggi precedenti. La bozza nell’editor non cambia.',accept:'Riparti'}))return;
+  const current=scope;
+  try{
+   const result=await api('/manager/chat/rewind',{workflow_id:currentWorkflow().id,run_id:app.run?.id||null,index});
+   if(scope!==current)return;
+   state.messages=result.messages;state.conversationId=result.conversation_id;state.proposal=null;state.warning=null;state.notice='';state.error='';state.input=result.message;state.version++;
+   renderChat();$('#manager-form').requestSubmit();
+  }catch(error){state.error=error.message;if(scope===current)renderChat()}
+ }
+ async function stopTurn(state){
+  if(!state.busy||state.stopping||!state.request)return;state.stopping=true;renderChat();
+  try{await api('/manager/chat/stop',state.request)}catch(error){state.stopping=false;state.error=error.message;renderChat()}
+ }
  function renderChat(){
   if(!open)return;const state=data();
-  $('#manager-panel').innerHTML=`<div class="manager-heading"><div class="manager-header-actions"><button type="button" id="manager-reset" class="manager-reset" ${state.busy?'disabled':''} title="Azzera chat">${icon('rotate-cw')}Azzera chat</button><button type="button" class="icon-button" id="manager-compact" aria-expanded="${!faceCollapsed}" aria-controls="manager-face" aria-label="${esc(uiText(faceCollapsed?'Mostra faccina':'Nascondi faccina'))}" title="${esc(uiText(faceCollapsed?'Mostra faccina':'Nascondi faccina'))}">${icon(faceCollapsed?'maximize-2':'minimize-2')}</button><button type="button" class="icon-button" id="manager-close" aria-label="Chiudi chat">${icon('x')}</button></div>${managerFace(state)}<div class="manager-title"><b>Project manager</b><small id="manager-context"></small></div></div><div id="manager-messages" role="log" aria-label="Messaggi del project manager" aria-live="polite">${state.messages.length?state.messages.map(m=>`<article data-no-i18n class="manager-message ${m.role==='user'?'from-user':'from-manager'}"><b>${m.role==='user'?uiText('Tu'):'Project manager'}</b><div class="${m.role==='assistant'?'manager-markdown markdown':''}">${m.role==='assistant'&&m.html?m.html:esc(m.text).replace(/\n/g,'<br>')}</div></article>`).join(''):`<div class="manager-empty">${icon('project-manager')}<p>Descrivi il workflow che vuoi creare, chiedi una modifica ai nodi o domandami a che punto è la run.</p></div>`}${state.busy?`<p class="manager-thinking" role="status">${icon('loader-circle')}Il manager sta analizzando il contesto…</p>`:''}</div><div id="manager-feedback" role="status">${state.notice?`<p class="manager-notice">${esc(state.notice)}</p>`:''}${state.warning?`<p class="manager-warning">${esc(uiText('Da completare prima di Esegui:'))} ${esc(state.warning)}</p>`:''}${state.error?`<section class="manager-error" role="alert"><button type="button" class="icon-button" id="manager-dismiss-error" aria-label="Chiudi errore">${icon('x')}</button><p>${esc(uiText(state.error))}</p><button type="button" id="manager-error-settings">${esc(uiText('Impostazioni agenti'))}</button></section>`:''}${state.proposal?`<div class="manager-proposal"><p>Proposta pronta. La run e le modifiche fatte nel frattempo restano conservate.</p><button type="button" id="manager-apply">${icon('workflow')}${app.run||state.proposalKind==='create'?uiText('Apri come nuovo workflow'):uiText('Applica alla bozza')}</button> <button type="button" id="manager-dismiss-proposal">${esc(uiText('Ignora proposta'))}</button></div>`:''}${state.undo?'<button type="button" id="manager-undo">Annulla ultima modifica del manager</button>':''}${previousDraft&&!app.run?'<button type="button" id="manager-restore">Torna alla bozza precedente</button>':''}</div><form id="manager-form"><label for="manager-input">Messaggio al manager</label><div class="manager-compose-row"><textarea id="manager-input" rows="1" maxlength="32000" placeholder="Es. aggiungi una review dopo i test…" required>${esc(state.input)}</textarea><button type="submit" class="primary manager-send" ${state.busy?'disabled':''}>${icon('play')}Invia</button></div><span class="small manager-runtime">${esc(app.settings?.default_runtime||state.runtime||'')} · ${uiText('Credenziali personali')}</span></form>`;
+  $('#manager-panel').innerHTML=`<div class="manager-heading"><div class="manager-header-actions"><button type="button" id="manager-reset" class="manager-reset" ${state.busy?'disabled':''} title="Azzera chat">${icon('rotate-cw')}Azzera chat</button><button type="button" class="icon-button" id="manager-compact" aria-expanded="${!faceCollapsed}" aria-controls="manager-face" aria-label="${esc(uiText(faceCollapsed?'Mostra faccina':'Nascondi faccina'))}" title="${esc(uiText(faceCollapsed?'Mostra faccina':'Nascondi faccina'))}">${icon(faceCollapsed?'maximize-2':'minimize-2')}</button><button type="button" class="icon-button" id="manager-close" aria-label="Chiudi chat">${icon('x')}</button></div>${managerFace(state)}<div class="manager-title"><b>Project manager</b><small id="manager-context"></small></div></div><div id="manager-messages" role="log" aria-label="Messaggi del project manager" aria-live="polite">${state.messages.length?state.messages.map((m,i)=>`<article data-no-i18n class="manager-message ${m.role==='user'?'from-user':'from-manager'}"><b>${m.role==='user'?uiText('Tu'):'Project manager'}</b>${m.role==='user'&&!state.busy?`<button type="button" class="icon-button manager-rewind" data-rewind="${i}" aria-label="${esc(uiText('Riparti da questo messaggio'))}" title="${esc(uiText('Riparti da questo messaggio'))}">${icon('refresh-cw')}</button>`:''}<div class="${m.role==='assistant'?'manager-markdown markdown':''}">${m.role==='assistant'&&m.html?m.html:esc(m.text).replace(/\n/g,'<br>')}</div></article>`).join(''):`<div class="manager-empty">${icon('project-manager')}<p>Descrivi il workflow che vuoi creare, chiedi una modifica ai nodi o domandami a che punto è la run.</p></div>`}${state.busy?`<div id="manager-activity" role="status">${activityHtml(state)}</div>`:''}</div><div id="manager-feedback" role="status">${state.notice?`<p class="manager-notice">${esc(state.notice)}</p>`:''}${state.warning?`<p class="manager-warning">${esc(uiText('Da completare prima di Esegui:'))} ${esc(state.warning)}</p>`:''}${state.error?`<section class="manager-error" role="alert"><button type="button" class="icon-button" id="manager-dismiss-error" aria-label="Chiudi errore">${icon('x')}</button><p>${esc(uiText(state.error))}</p><button type="button" id="manager-error-settings">${esc(uiText('Impostazioni agenti'))}</button></section>`:''}${state.proposal?`<div class="manager-proposal"><p>Proposta pronta. La run e le modifiche fatte nel frattempo restano conservate.</p><button type="button" id="manager-apply">${icon('workflow')}${app.run||state.proposalKind==='create'?uiText('Apri come nuovo workflow'):uiText('Applica alla bozza')}</button> <button type="button" id="manager-dismiss-proposal">${esc(uiText('Ignora proposta'))}</button></div>`:''}${state.undo?'<button type="button" id="manager-undo">Annulla ultima modifica del manager</button>':''}${previousDraft&&!app.run?'<button type="button" id="manager-restore">Torna alla bozza precedente</button>':''}</div><form id="manager-form"><label for="manager-input">Messaggio al manager</label><div class="manager-compose-row"><textarea id="manager-input" rows="1" maxlength="32000" placeholder="Es. aggiungi una review dopo i test…" required>${esc(state.input)}</textarea>${state.busy?`<button type="button" id="manager-stop" class="manager-send manager-stop" title="Interrompi l’elaborazione del manager" ${state.stopping?'disabled':''}>${icon('square')}${state.stopping?'Interruzione…':'Stop'}</button>`:`<button type="submit" class="primary manager-send">${icon('play')}Invia</button>`}</div><span class="small manager-runtime">${esc(app.settings?.default_runtime||state.runtime||'')} · ${uiText('Credenziali personali')}</span></form>`;
   $('#manager-compact').onclick=()=>{
     faceCollapsed=!faceCollapsed;
     $('#manager-face').hidden=faceCollapsed;
@@ -117,6 +158,8 @@
   inputObserver.disconnect();inputWidth=0;resizeInput(input);inputObserver.observe(input);
   $('#manager-input').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();if(!state.busy)$('#manager-form').requestSubmit()}};
   $('#manager-form').onsubmit=send;
+  $('#manager-stop')?.addEventListener('click',()=>stopTurn(state));
+  $$('[data-rewind]').forEach(button=>button.onclick=()=>rewindTo(state,Number(button.dataset.rewind)));
   $('#manager-restore')?.addEventListener('click',()=>{const current={workflow:structuredClone(app.wf),dirty:app.dirty};app.wf=previousDraft.workflow;app.dirty=previousDraft.dirty;previousDraft=current;app.selected=null;workflowOptions(app.wf.id);rememberWorkflow(app.wf.id);render();fit();renderChat()});
   $('#manager-apply')?.addEventListener('click',()=>applyPending(state));
   $('#manager-dismiss-proposal')?.addEventListener('click',()=>{
@@ -173,9 +216,13 @@
  async function send(event){
   event.preventDefault();const state=data(),message=state.input.trim();if(state.busy||!message)return;
   const originalDraft=state.input,originalScope=scope,workflow=structuredClone(currentWorkflow()),base=JSON.stringify(workflow),runId=app.run?.id||null;
-  state.busy=true;state.version++;state.error='';state.notice='';state.input='';if(state.messages.at(-1)?.role!=='user'||state.messages.at(-1)?.text!==message)state.messages.push({role:'user',text:message});renderChat();$('#manager-input')?.focus();
+  state.busy=true;state.stopping=false;state.activity=[];state.cursor=null;state.request={workflow_id:workflow.id,run_id:runId};state.version++;state.error='';state.notice='';state.input='';if(state.messages.at(-1)?.role!=='user'||state.messages.at(-1)?.text!==message)state.messages.push({role:'user',text:message});renderChat();$('#manager-input')?.focus();
+  const query=activityScope();let poll=null;
   try{
+   try{state.cursor=(await api('/manager/chat/activity?'+query)).cursor}catch{state.cursor=null}
+   poll=setInterval(()=>pollActivity(state,query,originalScope),1000);
    const response=await api('/manager/chat',{workflow,run_id:runId,message,conversation_id:state.conversationId||null});state.messages=response.messages;state.runtime=response.runtime;state.conversationId=response.conversation_id;state.warning=response.validation_warning;
+   if(response.stopped)state.notice=uiText('Elaborazione interrotta. Puoi inviare un nuovo messaggio.');
    if(response.workflow){
     state.base=base;state.proposalId=response.proposal_id??'';state.proposalKind=response.kind||'edit';
     state.notice=uiText('Editor aggiornato:')+' '+response.workflow.nodes.length+' '+uiText('nodi')+', '+response.workflow.edges.length+' '+uiText('collegamenti');
@@ -183,7 +230,8 @@
    }
   }catch(error){state.error=error.message;if(!state.input)state.input=originalDraft}
   finally{
-   state.busy=false;
+   clearInterval(poll);
+   state.busy=false;state.stopping=false;state.request=null;
    if(scope===originalScope&&open){
     const input=$('#manager-input'),focused=document.activeElement===input,selection=input?[input.selectionStart,input.selectionEnd]:null;
     renderChat();
