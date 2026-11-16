@@ -22,7 +22,7 @@ English | [简体中文](README_zh-CN.md)
 </p>
 
 <p align="center">
-  Describe the job, get an editable workflow on a visual canvas, and run Claude Code, Codex and Pi through the tests, reviews and approvals you define. Self-hosted.
+  Describe the job, get an editable workflow on a visual canvas, and run Claude Code, Codex and Pi through the tests, reviews and approvals you define. Ships with spec-driven workflows for Spec Kit. Self-hosted.
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@ English | [简体中文](README_zh-CN.md)
 
 ## What you can build
 
-- **Feature delivery with Spec Kit.** Turn a feature idea into a specification, plan and tasks, then implement it and run local tests.
+- **Spec-driven development with Spec Kit or OpenSpec.** Turn a feature idea into a specification, plan and tasks, get them approved, then implement and verify the code against the spec with tests run on the server. See [Spec-driven development with rightcommit](SPEC-DRIVEN-DEVELOPMENT.md).
 - **GitHub issue triage.** Read an issue and the repository to draft requirements, acceptance criteria and a test plan.
 - **Confluence reporting.** Turn a page into a briefing that cites its source and lists risks, open questions and proposed tests.
 
@@ -186,6 +186,7 @@ provider authorization and credential scope still apply.
 
 | Document | What it covers |
 |---|---|
+| [SPEC-DRIVEN-DEVELOPMENT.md](SPEC-DRIVEN-DEVELOPMENT.md) | Run spec-driven development with Spec Kit or OpenSpec: a worked example and the SDD workflow templates |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each version |
 | [ADD_A_SKILL.md](ADD_A_SKILL.md) | Give a skill to Claude Code, Codex and Pi in one step |
 | [ADD-PI-PACKAGES.md](ADD-PI-PACKAGES.md) | Add packages from pi.dev to the Pi agent |

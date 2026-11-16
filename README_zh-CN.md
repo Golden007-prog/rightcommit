@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  描述要做的事，即可在可视化画布上获得可编辑的工作流。让 Claude Code、Codex 和 Pi 按你设定的流程执行任务，并经过你指定的测试、审查和审批。支持自托管。
+  描述要做的事，即可在可视化画布上获得可编辑的工作流。让 Claude Code、Codex 和 Pi 按你设定的流程执行任务，并经过你指定的测试、审查和审批。内置适用于 Spec Kit 的规范驱动工作流。支持自托管。
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@
 
 ## 可以用它构建什么
 
-- **用 Spec Kit 交付新功能。** 从功能想法出发，编写规范、计划和任务清单，再实现功能并运行本地测试。
+- **用 Spec Kit 或 OpenSpec 进行规范驱动开发。** 从功能想法出发，编写规范、计划和任务清单并提交审批，然后实现代码，并在服务器上运行测试，对照规范验证代码。详见 [使用 rightcommit 进行规范驱动开发](SPEC-DRIVEN-DEVELOPMENT.md)。
 - **梳理 GitHub Issue。** 阅读 Issue 并查看代码仓库，起草需求、验收标准和测试计划。
 - **根据 Confluence 页面生成简报。** 在简报中引用原文，列出风险、待确认的问题和建议的测试。
 
@@ -176,6 +176,7 @@ rightcommit 支持个人使用，也支持在组织内部部署并使用独立�
 
 | 文档 | 内容 |
 |---|---|
+| [SPEC-DRIVEN-DEVELOPMENT.md](SPEC-DRIVEN-DEVELOPMENT.md) | 用 Spec Kit 或 OpenSpec 进行规范驱动开发：完整示例和 SDD 工作流模板 |
 | [CHANGELOG.md](CHANGELOG.md) | 各版本的变更 |
 | [ADD_A_SKILL.md](ADD_A_SKILL.md) | 一次为 Claude Code、Codex 和 Pi 添加技能 |
 | [ADD-PI-PACKAGES.md](ADD-PI-PACKAGES.md) | 将 pi.dev 上的包添加到 Pi 智能体 |
